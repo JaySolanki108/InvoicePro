@@ -1,4 +1,3 @@
-
 <?php
 // Invoice Pro - Aiven MySQL connection
 
