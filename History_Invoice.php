@@ -1,3 +1,4 @@
+
 <?php
 session_start();
 
@@ -20,29 +21,27 @@ if (empty($_SESSION['csrf_token'])) {
 $csrfToken = $_SESSION['csrf_token'];
 
 /* =========================================================
-   USER DETAILS
-========================================================= */
-$userStmt = $conn->prepare("
-    SELECT company_name, company_email, phone, address
-    FROM users
-    WHERE id = ?
-    LIMIT 1
-");
-
-$userStmt->bind_param("i", $userId);
-$userStmt->execute();
-$userResult = $userStmt->get_result();
-$user = $userResult->fetch_assoc();
-
-$companyName = $user['company_name'] ?? 'Invoice Pro';
-
-/* =========================================================
    HELPER
 ========================================================= */
 function e($value)
 {
     return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8');
 }
+
+/* =========================================================
+   USER DETAILS
+========================================================= */
+$userStmt = $db->prepare("
+    SELECT company_name, company_email, phone, address
+    FROM users
+    WHERE id = :user_id
+    LIMIT 1
+");
+
+$userStmt->execute(['user_id' => $userId]);
+$user = $userStmt->fetch(PDO::FETCH_ASSOC);
+
+$companyName = $user['company_name'] ?? 'Invoice Pro';
 
 /* =========================================================
    DELETE INVOICE
@@ -62,65 +61,70 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'delet
     $invoiceId = (int)($_POST['invoice_id'] ?? 0);
 
     if ($invoiceId > 0) {
-
-        $conn->begin_transaction();
-
         try {
+            $db->beginTransaction();
 
-            /* Make sure invoice belongs to logged-in user */
-            $checkStmt = $conn->prepare("
+            $checkStmt = $db->prepare("
                 SELECT id
                 FROM invoices
-                WHERE id = ? AND user_id = ?
+                WHERE id = :invoice_id AND user_id = :user_id
                 LIMIT 1
             ");
 
-            $checkStmt->bind_param("ii", $invoiceId, $userId);
-            $checkStmt->execute();
-            $checkResult = $checkStmt->get_result();
+            $checkStmt->execute([
+                'invoice_id' => $invoiceId,
+                'user_id' => $userId
+            ]);
 
-            if (!$checkResult->fetch_assoc()) {
+            if (!$checkStmt->fetch(PDO::FETCH_ASSOC)) {
                 throw new Exception("Invoice not found.");
             }
 
-            /* Delete invoice items first */
-            $itemStmt = $conn->prepare("
+            $itemStmt = $db->prepare("
                 DELETE FROM invoice_items
-                WHERE invoice_id = ?
+                WHERE invoice_id = :invoice_id
             ");
 
-            $itemStmt->bind_param("i", $invoiceId);
-            $itemStmt->execute();
+            $itemStmt->execute(['invoice_id' => $invoiceId]);
 
-            /* Delete invoice */
-            $invoiceStmt = $conn->prepare("
+            $invoiceStmt = $db->prepare("
                 DELETE FROM invoices
-                WHERE id = ? AND user_id = ?
+                WHERE id = :invoice_id AND user_id = :user_id
             ");
 
-            $invoiceStmt->bind_param("ii", $invoiceId, $userId);
-            $invoiceStmt->execute();
+            $invoiceStmt->execute([
+                'invoice_id' => $invoiceId,
+                'user_id' => $userId
+            ]);
 
-            if ($invoiceStmt->affected_rows <= 0) {
+            if ($invoiceStmt->rowCount() <= 0) {
                 throw new Exception("Invoice could not be deleted.");
             }
 
-            $conn->commit();
+            $db->commit();
 
             $_SESSION['history_message'] = [
                 'type' => 'success',
                 'text' => 'Invoice deleted successfully.'
             ];
 
-        } catch (Exception $e) {
+        } catch (Throwable $e) {
+            if ($db->inTransaction()) {
+                $db->rollBack();
+            }
 
-            $conn->rollback();
+            error_log("Invoice delete error: " . $e->getMessage());
 
             $_SESSION['history_message'] = [
                 'type' => 'error',
-                'text' => $e->getMessage()
+                'text' => 'Unable to delete invoice. Please try again.'
             ];
         }
+    } else {
+        $_SESSION['history_message'] = [
+            'type' => 'error',
+            'text' => 'Invalid invoice.'
+        ];
     }
 
     header("Location: History_Invoice.php");
@@ -148,15 +152,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'updat
     $customerEmail = trim($_POST['customer_email'] ?? '');
     $customerPhone = trim($_POST['customer_phone'] ?? '');
     $customerAddress = trim($_POST['customer_address'] ?? '');
-    $issueDate = $_POST['issue_date'] ?? '';
+    $issueDate = trim($_POST['issue_date'] ?? '');
 
-    $subtotal = (float)($_POST['subtotal'] ?? 0);
-    $tax = (float)($_POST['tax'] ?? 0);
+    $subtotalInput = $_POST['subtotal'] ?? 0;
+    $taxInput = $_POST['tax'] ?? 0;
 
-    $total = $subtotal + $tax;
-
-    if ($invoiceId <= 0 || $customerName === '' || $issueDate === '') {
-
+    if (
+        $invoiceId <= 0 ||
+        $customerName === '' ||
+        $issueDate === ''
+    ) {
         $_SESSION['history_message'] = [
             'type' => 'error',
             'text' => 'Please fill all required fields.'
@@ -166,80 +171,111 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'updat
         exit();
     }
 
-    if ($subtotal < 0 || $tax < 0) {
+    $dateObject = DateTime::createFromFormat('!Y-m-d', $issueDate);
 
+    if (!$dateObject || $dateObject->format('Y-m-d') !== $issueDate) {
         $_SESSION['history_message'] = [
             'type' => 'error',
-            'text' => 'Amount cannot be negative.'
+            'text' => 'Please enter a valid invoice date.'
         ];
 
         header("Location: History_Invoice.php");
         exit();
     }
 
-    $checkStmt = $conn->prepare("
-        SELECT id
-        FROM invoices
-        WHERE id = ? AND user_id = ?
-        LIMIT 1
-    ");
-
-    $checkStmt->bind_param("ii", $invoiceId, $userId);
-    $checkStmt->execute();
-
-    $checkResult = $checkStmt->get_result();
-
-    if (!$checkResult->fetch_assoc()) {
-
+    if (
+        !is_numeric($subtotalInput) ||
+        !is_numeric($taxInput) ||
+        (float)$subtotalInput < 0 ||
+        (float)$taxInput < 0
+    ) {
         $_SESSION['history_message'] = [
             'type' => 'error',
-            'text' => 'Invoice not found.'
+            'text' => 'Please enter valid non-negative amounts.'
         ];
 
         header("Location: History_Invoice.php");
         exit();
     }
 
-    $updateStmt = $conn->prepare("
-        UPDATE invoices
-        SET
-            customer_name = ?,
-            customer_email = ?,
-            customer_phone = ?,
-            customer_address = ?,
-            issue_date = ?,
-            subtotal = ?,
-            tax = ?,
-            total = ?
-        WHERE id = ? AND user_id = ?
-    ");
+    if (
+        $customerEmail !== '' &&
+        !filter_var($customerEmail, FILTER_VALIDATE_EMAIL)
+    ) {
+        $_SESSION['history_message'] = [
+            'type' => 'error',
+            'text' => 'Please enter a valid customer email.'
+        ];
 
-    $updateStmt->bind_param(
-        "sssssdddii",
-        $customerName,
-        $customerEmail,
-        $customerPhone,
-        $customerAddress,
-        $issueDate,
-        $subtotal,
-        $tax,
-        $total,
-        $invoiceId,
-        $userId
-    );
+        header("Location: History_Invoice.php");
+        exit();
+    }
 
-    if ($updateStmt->execute()) {
+    $subtotal = (float)$subtotalInput;
+    $tax = (float)$taxInput;
+    $total = $subtotal + $tax;
+
+    try {
+        $checkStmt = $db->prepare("
+            SELECT id
+            FROM invoices
+            WHERE id = :invoice_id AND user_id = :user_id
+            LIMIT 1
+        ");
+
+        $checkStmt->execute([
+            'invoice_id' => $invoiceId,
+            'user_id' => $userId
+        ]);
+
+        if (!$checkStmt->fetch(PDO::FETCH_ASSOC)) {
+            $_SESSION['history_message'] = [
+                'type' => 'error',
+                'text' => 'Invoice not found.'
+            ];
+
+            header("Location: History_Invoice.php");
+            exit();
+        }
+
+        $updateStmt = $db->prepare("
+            UPDATE invoices
+            SET
+                customer_name = :customer_name,
+                customer_email = :customer_email,
+                customer_phone = :customer_phone,
+                customer_address = :customer_address,
+                issue_date = :issue_date,
+                subtotal = :subtotal,
+                tax = :tax,
+                total = :total
+            WHERE id = :invoice_id AND user_id = :user_id
+        ");
+
+        $updateStmt->execute([
+            'customer_name' => $customerName,
+            'customer_email' => $customerEmail,
+            'customer_phone' => $customerPhone,
+            'customer_address' => $customerAddress,
+            'issue_date' => $issueDate,
+            'subtotal' => $subtotal,
+            'tax' => $tax,
+            'total' => $total,
+            'invoice_id' => $invoiceId,
+            'user_id' => $userId
+        ]);
 
         $_SESSION['history_message'] = [
             'type' => 'success',
             'text' => 'Invoice updated successfully.'
         ];
 
-    } else {
+    } catch (Throwable $e) {
+        error_log("Invoice update error: " . $e->getMessage());
 
         $_SESSION['history_message'] = [
             'type' => 'error',
-            'text' => 'Unable to update invoice.'
+            'text' => 'Unable to update invoice. Please try again.'
         ];
     }
 
@@ -253,39 +289,38 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'updat
 $search = trim($_GET['search'] ?? '');
 $dateRange = $_GET['date_range'] ?? '';
 
-$where = " WHERE i.user_id = ? ";
-$params = [$userId];
-$types = "i";
+$allowedDateRanges = ['', '7', '30', 'month'];
+
+if (!in_array($dateRange, $allowedDateRanges, true)) {
+    $dateRange = '';
+}
+
+$where = " WHERE i.user_id = :user_id ";
+$params = ['user_id' => $userId];
 
 if ($search !== '') {
-
     $where .= "
         AND (
-            i.invoice_number LIKE ?
-            OR i.customer_name LIKE ?
-            OR i.customer_email LIKE ?
+            i.invoice_number LIKE :search_number
+            OR i.customer_name LIKE :search_customer
+            OR i.customer_email LIKE :search_email
         )
     ";
 
-    $searchValue = "%" . $search . "%";
+    $searchValue = '%' . $search . '%';
 
-    $params[] = $searchValue;
-    $params[] = $searchValue;
-    $params[] = $searchValue;
-
-    $types .= "sss";
+    $params['search_number'] = $searchValue;
+    $params['search_customer'] = $searchValue;
+    $params['search_email'] = $searchValue;
 }
 
 if ($dateRange === '7') {
-
     $where .= " AND i.issue_date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY) ";
 
 } elseif ($dateRange === '30') {
-
     $where .= " AND i.issue_date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY) ";
 
 } elseif ($dateRange === 'month') {
-
     $where .= "
         AND YEAR(i.issue_date) = YEAR(CURDATE())
         AND MONTH(i.issue_date) = MONTH(CURDATE())
@@ -295,20 +330,17 @@ if ($dateRange === '7') {
 /* =========================================================
    STATS
 ========================================================= */
-$statsStmt = $conn->prepare("
+$statsStmt = $db->prepare("
     SELECT
         COUNT(*) AS total,
-        SUM(CASE WHEN total > 0 THEN 1 ELSE 0 END) AS paid,
-        SUM(CASE WHEN total = 0 THEN 1 ELSE 0 END) AS pending
+        COALESCE(SUM(CASE WHEN i.total > 0 THEN 1 ELSE 0 END), 0) AS paid,
+        COALESCE(SUM(CASE WHEN i.total = 0 THEN 1 ELSE 0 END), 0) AS pending
     FROM invoices i
     $where
 ");
 
-$statsStmt->bind_param($types, ...$params);
-$statsStmt->execute();
-
-$statsResult = $statsStmt->get_result();
-$stats = $statsResult->fetch_assoc();
+$statsStmt->execute($params);
+$stats = $statsStmt->fetch(PDO::FETCH_ASSOC);
 
 $totalInvoices = (int)($stats['total'] ?? 0);
 $paidInvoices = (int)($stats['paid'] ?? 0);
@@ -317,17 +349,14 @@ $pendingInvoices = (int)($stats['pending'] ?? 0);
 /* =========================================================
    TOTAL REVENUE
 ========================================================= */
-$revenueStmt = $conn->prepare("
+$revenueStmt = $db->prepare("
     SELECT COALESCE(SUM(i.total), 0) AS revenue
     FROM invoices i
     $where
 ");
 
-$revenueStmt->bind_param($types, ...$params);
-$revenueStmt->execute();
-
-$revenueResult = $revenueStmt->get_result();
-$revenueData = $revenueResult->fetch_assoc();
+$revenueStmt->execute($params);
+$revenueData = $revenueStmt->fetch(PDO::FETCH_ASSOC);
 
 $totalRevenue = (float)($revenueData['revenue'] ?? 0);
 
@@ -335,20 +364,16 @@ $totalRevenue = (float)($revenueData['revenue'] ?? 0);
    PAGINATION
 ========================================================= */
 $perPage = 10;
-
 $page = max(1, (int)($_GET['page'] ?? 1));
 
-$countStmt = $conn->prepare("
+$countStmt = $db->prepare("
     SELECT COUNT(*) AS total
     FROM invoices i
     $where
 ");
 
-$countStmt->bind_param($types, ...$params);
-$countStmt->execute();
-
-$countResult = $countStmt->get_result();
-$countData = $countResult->fetch_assoc();
+$countStmt->execute($params);
+$countData = $countStmt->fetch(PDO::FETCH_ASSOC);
 
 $totalRows = (int)($countData['total'] ?? 0);
 $totalPages = max(1, (int)ceil($totalRows / $perPage));
@@ -377,24 +402,20 @@ $invoiceSql = "
     FROM invoices i
     $where
     ORDER BY i.id DESC
-    LIMIT ? OFFSET ?
+    LIMIT :limit OFFSET :offset
 ";
 
-$invoiceStmt = $conn->prepare($invoiceSql);
+$invoiceStmt = $db->prepare($invoiceSql);
 
-$invoiceTypes = $types . "ii";
-$invoiceParams = array_merge($params, [$perPage, $offset]);
-
-$invoiceStmt->bind_param($invoiceTypes, ...$invoiceParams);
-$invoiceStmt->execute();
-
-$invoiceResult = $invoiceStmt->get_result();
-
-$invoices = [];
-
-while ($row = $invoiceResult->fetch_assoc()) {
-    $invoices[] = $row;
+foreach ($params as $key => $value) {
+    $invoiceStmt->bindValue(':' . $key, $value);
 }
+
+$invoiceStmt->bindValue(':limit', $perPage, PDO::PARAM_INT);
+$invoiceStmt->bindValue(':offset', $offset, PDO::PARAM_INT);
+
+$invoiceStmt->execute();
+$invoices = $invoiceStmt->fetchAll(PDO::FETCH_ASSOC);
 
 /* =========================================================
    VIEW INVOICE
@@ -402,12 +423,10 @@ while ($row = $invoiceResult->fetch_assoc()) {
 $viewInvoice = null;
 
 if (isset($_GET['view'])) {
-
     $viewId = (int)$_GET['view'];
 
     if ($viewId > 0) {
-
-        $viewStmt = $conn->prepare("
+        $viewStmt = $db->prepare("
             SELECT
                 i.id,
                 i.invoice_number,
@@ -420,39 +439,33 @@ if (isset($_GET['view'])) {
                 i.tax,
                 i.total
             FROM invoices i
-            WHERE i.id = ? AND i.user_id = ?
+            WHERE i.id = :invoice_id
+              AND i.user_id = :user_id
             LIMIT 1
         ");
 
-        $viewStmt->bind_param("ii", $viewId, $userId);
-        $viewStmt->execute();
+        $viewStmt->execute([
+            'invoice_id' => $viewId,
+            'user_id' => $userId
+        ]);
 
-        $viewResult = $viewStmt->get_result();
-        $viewInvoice = $viewResult->fetch_assoc();
+        $viewInvoice = $viewStmt->fetch(PDO::FETCH_ASSOC);
 
         if ($viewInvoice) {
-
-            $itemStmt = $conn->prepare("
+            $itemStmt = $db->prepare("
                 SELECT
                     product_name,
                     quantity,
                     rate,
                     amount
                 FROM invoice_items
-                WHERE invoice_id = ?
+                WHERE invoice_id = :invoice_id
                 ORDER BY id ASC
             ");
 
-            $itemStmt->bind_param("i", $viewId);
-            $itemStmt->execute();
+            $itemStmt->execute(['invoice_id' => $viewId]);
 
-            $itemResult = $itemStmt->get_result();
-
-            $viewInvoice['items'] = [];
-
-            while ($item = $itemResult->fetch_assoc()) {
-                $viewInvoice['items'][] = $item;
-            }
+            $viewInvoice['items'] = $itemStmt->fetchAll(PDO::FETCH_ASSOC);
         }
     }
 }
@@ -464,15 +477,15 @@ function pageUrl($pageNumber)
 {
     $query = [];
 
-    if (!empty($_GET['search'])) {
+    if (isset($_GET['search']) && $_GET['search'] !== '') {
         $query['search'] = $_GET['search'];
     }
 
-    if (!empty($_GET['date_range'])) {
+    if (isset($_GET['date_range']) && $_GET['date_range'] !== '') {
         $query['date_range'] = $_GET['date_range'];
     }
 
-    $query['page'] = $pageNumber;
+    $query['page'] = (int)$pageNumber;
 
     return 'History_Invoice.php?' . http_build_query($query);
 }
@@ -484,6 +497,7 @@ $message = $_SESSION['history_message'] ?? null;
 unset($_SESSION['history_message']);
 
 ?>
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
