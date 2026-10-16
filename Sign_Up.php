@@ -1,103 +1,63 @@
 <?php
-
 $error = '';
 $success = '';
 
 require_once "config.php";
 
-if ($_SERVER["REQUEST_METHOD"] == "POST") {
-
+if ($_SERVER["REQUEST_METHOD"] === "POST") {
     $company_name = trim($_POST['company_name'] ?? '');
     $email = trim($_POST['email'] ?? '');
     $password = $_POST['password'] ?? '';
     $confirm_password = $_POST['confirm_password'] ?? '';
 
     if (
-        empty($company_name) ||
-        empty($email) ||
-        empty($password) ||
-        empty($confirm_password)
+        $company_name === '' ||
+        $email === '' ||
+        $password === '' ||
+        $confirm_password === ''
     ) {
-
         $error = "Please fill in all fields.";
-
     } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
-
         $error = "Please enter a valid email address.";
-
     } elseif ($password !== $confirm_password) {
-
         $error = "Passwords do not match.";
-
     } else {
+        try {
+            $check_stmt = $db->prepare(
+                "SELECT id FROM users WHERE company_email = ? LIMIT 1"
+            );
 
-        $check_stmt = $conn->prepare(
-            "SELECT id FROM users WHERE company_email = ? LIMIT 1"
-        );
+            $check_stmt->execute([$email]);
 
-        if ($check_stmt) {
-
-            $check_stmt->bind_param("s", $email);
-            $check_stmt->execute();
-
-            $check_result = $check_stmt->get_result();
-
-            if ($check_result->num_rows > 0) {
-
+            if ($check_stmt->fetch(PDO::FETCH_ASSOC)) {
                 $error = "An account with this email already exists.";
-
             } else {
-
                 $hashed_password = password_hash(
                     $password,
                     PASSWORD_DEFAULT
                 );
 
-                $insert_stmt = $conn->prepare(
-                    "INSERT INTO users
-                    (company_name, company_email, password)
-                    VALUES (?, ?, ?)"
+                $insert_stmt = $db->prepare(
+                    "INSERT INTO users (company_name, company_email, password)
+                     VALUES (?, ?, ?)"
                 );
 
-                if ($insert_stmt) {
+                $insert_stmt->execute([
+                    $company_name,
+                    $email,
+                    $hashed_password
+                ]);
 
-                    $insert_stmt->bind_param(
-                        "sss",
-                        $company_name,
-                        $email,
-                        $hashed_password
-                    );
-
-                    if ($insert_stmt->execute()) {
-
-                        header("Location: Login.php");
-                        exit();
-
-                    } else {
-
-                        $error = "Unable to create account. Please try again.";
-
-                    }
-
-                    $insert_stmt->close();
-
-                } else {
-
-                    $error = "Something went wrong. Please try again.";
-
-                }
+                header("Location: Login.php");
+                exit;
             }
-
-            $check_stmt->close();
-
-        } else {
-
-            $error = "Something went wrong. Please try again.";
-
+        } catch (PDOException $e) {
+            error_log("Signup database error: " . $e->getMessage());
+            http_response_code(500);
+            $error = "Unable to create account. Please try again.";
         }
     }
 }
-
 ?>
 
 <!DOCTYPE html>
