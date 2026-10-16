@@ -1,80 +1,52 @@
 <?php
-
 session_start();
 require_once "config.php";
 
 $error = '';
 $success = '';
 
-if ($_SERVER["REQUEST_METHOD"] == "POST") {
-
+if ($_SERVER["REQUEST_METHOD"] === "POST") {
     $email = trim($_POST['email'] ?? '');
     $password = $_POST['password'] ?? '';
 
-    if (empty($email) || empty($password)) {
-
+    if ($email === '' || $password === '') {
         $error = "Please fill in all fields.";
-
     } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
-
         $error = "Please enter a valid email address.";
-
     } else {
+        try {
+            $stmt = $db->prepare(
+                "SELECT id, company_name, company_email, password, phone, address
+                 FROM users
+                 WHERE company_email = ?
+                 LIMIT 1"
+            );
 
-        $stmt = $conn->prepare(
-            "SELECT id, company_name, company_email, password, phone, address
-             FROM users
-             WHERE company_email = ?
-             LIMIT 1"
-        );
+            $stmt->execute([$email]);
+            $user = $stmt->fetch(PDO::FETCH_ASSOC);
 
-        if ($stmt) {
+            if ($user && password_verify($password, $user['password'])) {
+                session_regenerate_id(true);
 
-            $stmt->bind_param("s", $email);
-            $stmt->execute();
+                $_SESSION['user_id'] = $user['id'];
+                $_SESSION['company_name'] = $user['company_name'];
+                $_SESSION['company_email'] = $user['company_email'];
+                $_SESSION['phone'] = $user['phone'] ?? '';
+                $_SESSION['address'] = $user['address'] ?? '';
+                $_SESSION['logged_in'] = true;
 
-            $result = $stmt->get_result();
-
-            if ($result->num_rows === 1) {
-
-                $user = $result->fetch_assoc();
-
-                if (password_verify($password, $user['password'])) {
-
-                    session_regenerate_id(true);
-
-                    $_SESSION['user_id'] = $user['id'];
-                    $_SESSION['company_name'] = $user['company_name'];
-                    $_SESSION['company_email'] = $user['company_email'];
-                    $_SESSION['phone'] = $user['phone'];
-                    $_SESSION['address'] = $user['address'];
-                    $_SESSION['logged_in'] = true;
-
-                    header("Location: Dashboard.php");
-                    exit();
-
-                } else {
-
-                    $error = "Incorrect email or password.";
-
-                }
-
-            } else {
-
-                $error = "Incorrect email or password.";
-
+                header("Location: Dashboard.php");
+                exit;
             }
 
-            $stmt->close();
-
-        } else {
-
-            $error = "Something went wrong. Please try again.";
-
+            $error = "Incorrect email or password.";
+        } catch (PDOException $e) {
+            error_log("Login database error: " . $e->getMessage());
+            http_response_code(500);
+            $error = "Unable to log in right now. Please try again.";
         }
     }
 }
-
 ?>
 
 <!DOCTYPE html>
