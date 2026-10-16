@@ -1,24 +1,18 @@
+
 <?php
-
 session_start();
-
 require_once "config.php";
-
 
 /* =========================================================
    LOGIN CHECK
 ========================================================= */
 
 if (!isset($_SESSION['user_id'])) {
-
     header("Location: Login.php");
-
     exit;
 }
 
-
 $userId = (int) $_SESSION['user_id'];
-
 
 /* =========================================================
    HELPER
@@ -26,27 +20,18 @@ $userId = (int) $_SESSION['user_id'];
 
 function clean($value)
 {
-    return htmlspecialchars(
-        (string)$value,
-        ENT_QUOTES,
-        'UTF-8'
-    );
+    return htmlspecialchars((string) $value, ENT_QUOTES, 'UTF-8');
 }
-
 
 /* =========================================================
    CSRF TOKEN
 ========================================================= */
 
 if (empty($_SESSION['invoice_csrf'])) {
-
-    $_SESSION['invoice_csrf'] =
-        bin2hex(random_bytes(32));
+    $_SESSION['invoice_csrf'] = bin2hex(random_bytes(32));
 }
 
-$csrfToken =
-    $_SESSION['invoice_csrf'];
-
+$csrfToken = $_SESSION['invoice_csrf'];
 
 /* =========================================================
    DELETE INVOICE
@@ -54,183 +39,81 @@ $csrfToken =
 
 if (
     $_SERVER['REQUEST_METHOD'] === 'POST' &&
-    isset($_POST['action']) &&
-    $_POST['action'] === 'delete_invoice'
+    ($_POST['action'] ?? '') === 'delete_invoice'
 ) {
+    $postedToken = $_POST['csrf_token'] ?? '';
 
-    $postedToken =
-        $_POST['csrf_token'] ?? '';
-
-    if (
-        !hash_equals(
-            $csrfToken,
-            $postedToken
-        )
-    ) {
-
-        $_SESSION['dashboard_message'] =
-            "Invalid request.";
-
-        $_SESSION['dashboard_message_type'] =
-            "error";
-
+    if (!is_string($postedToken) || !hash_equals($csrfToken, $postedToken)) {
+        $_SESSION['dashboard_message'] = "Invalid request.";
+        $_SESSION['dashboard_message_type'] = "error";
         header("Location: Dashboard.php");
-
         exit;
     }
 
-
-    $invoiceId =
-        isset($_POST['invoice_id'])
-            ? (int)$_POST['invoice_id']
-            : 0;
-
+    $invoiceId = (int) ($_POST['invoice_id'] ?? 0);
 
     if ($invoiceId <= 0) {
-
-        $_SESSION['dashboard_message'] =
-            "Invalid invoice.";
-
-        $_SESSION['dashboard_message_type'] =
-            "error";
-
+        $_SESSION['dashboard_message'] = "Invalid invoice.";
+        $_SESSION['dashboard_message_type'] = "error";
         header("Location: Dashboard.php");
-
         exit;
     }
-
-
-    /*
-       First make sure this invoice belongs
-       to the logged-in user.
-    */
-
-    $checkStmt = $conn->prepare("
-        SELECT id
-        FROM invoices
-        WHERE id = ?
-        AND user_id = ?
-        LIMIT 1
-    ");
-
-    $checkStmt->bind_param(
-        "ii",
-        $invoiceId,
-        $userId
-    );
-
-    $checkStmt->execute();
-
-    $checkResult =
-        $checkStmt->get_result();
-
-    $invoiceExists =
-        $checkResult->num_rows === 1;
-
-    $checkStmt->close();
-
-
-    if (!$invoiceExists) {
-
-        $_SESSION['dashboard_message'] =
-            "Invoice not found.";
-
-        $_SESSION['dashboard_message_type'] =
-            "error";
-
-        header("Location: Dashboard.php");
-
-        exit;
-    }
-
-
-    /*
-       Delete invoice + all invoice items
-       inside one transaction.
-    */
-
-    $conn->begin_transaction();
 
     try {
+        $db->beginTransaction();
 
-        $itemDeleteStmt = $conn->prepare("
+        $checkStmt = $db->prepare("
+            SELECT id
+            FROM invoices
+            WHERE id = ? AND user_id = ?
+            LIMIT 1
+        ");
+        $checkStmt->execute([$invoiceId, $userId]);
+
+        if (!$checkStmt->fetch(PDO::FETCH_ASSOC)) {
+            $db->rollBack();
+
+            $_SESSION['dashboard_message'] = "Invoice not found.";
+            $_SESSION['dashboard_message_type'] = "error";
+            header("Location: Dashboard.php");
+            exit;
+        }
+
+        $itemDeleteStmt = $db->prepare("
             DELETE FROM invoice_items
             WHERE invoice_id = ?
         ");
+        $itemDeleteStmt->execute([$invoiceId]);
 
-        $itemDeleteStmt->bind_param(
-            "i",
-            $invoiceId
-        );
-
-        if (!$itemDeleteStmt->execute()) {
-
-            throw new Exception(
-                "Unable to delete invoice items."
-            );
-        }
-
-        $itemDeleteStmt->close();
-
-
-        $invoiceDeleteStmt = $conn->prepare("
+        $invoiceDeleteStmt = $db->prepare("
             DELETE FROM invoices
-            WHERE id = ?
-            AND user_id = ?
+            WHERE id = ? AND user_id = ?
         ");
+        $invoiceDeleteStmt->execute([$invoiceId, $userId]);
 
-        $invoiceDeleteStmt->bind_param(
-            "ii",
-            $invoiceId,
-            $userId
-        );
-
-        if (!$invoiceDeleteStmt->execute()) {
-
-            throw new Exception(
-                "Unable to delete invoice."
-            );
+        if ($invoiceDeleteStmt->rowCount() !== 1) {
+            throw new RuntimeException("Invoice could not be deleted.");
         }
 
+        $db->commit();
 
-        if ($invoiceDeleteStmt->affected_rows !== 1) {
+        $_SESSION['dashboard_message'] = "Invoice deleted successfully.";
+        $_SESSION['dashboard_message_type'] = "success";
 
-            throw new Exception(
-                "Invoice could not be deleted."
-            );
+    } catch (Throwable $e) {
+        if ($db->inTransaction()) {
+            $db->rollBack();
         }
 
-        $invoiceDeleteStmt->close();
+        error_log("Invoice deletion failed: " . $e->getMessage());
 
-
-        $conn->commit();
-
-
-        $_SESSION['dashboard_message'] =
-            "Invoice deleted successfully.";
-
-        $_SESSION['dashboard_message_type'] =
-            "success";
-
-
-    } catch (Exception $e) {
-
-        $conn->rollback();
-
-
-        $_SESSION['dashboard_message'] =
-            $e->getMessage();
-
-        $_SESSION['dashboard_message_type'] =
-            "error";
+        $_SESSION['dashboard_message'] = "Unable to delete invoice. Please try again.";
+        $_SESSION['dashboard_message_type'] = "error";
     }
 
-
     header("Location: Dashboard.php");
-
     exit;
 }
-
 
 /* =========================================================
    UPDATE INVOICE
@@ -238,357 +121,153 @@ if (
 
 if (
     $_SERVER['REQUEST_METHOD'] === 'POST' &&
-    isset($_POST['action']) &&
-    $_POST['action'] === 'update_invoice'
+    ($_POST['action'] ?? '') === 'update_invoice'
 ) {
+    header('Content-Type: application/json; charset=utf-8');
 
-    header('Content-Type: application/json');
+    $postedToken = $_POST['csrf_token'] ?? '';
 
-
-    $postedToken =
-        $_POST['csrf_token'] ?? '';
-
-
-    if (
-        !hash_equals(
-            $csrfToken,
-            $postedToken
-        )
-    ) {
-
+    if (!is_string($postedToken) || !hash_equals($csrfToken, $postedToken)) {
         echo json_encode([
             "success" => false,
             "message" => "Invalid request."
         ]);
-
         exit;
     }
 
-
-    $invoiceId =
-        isset($_POST['invoice_id'])
-            ? (int)$_POST['invoice_id']
-            : 0;
-
-
-    $customerName =
-        trim(
-            $_POST['customer_name'] ?? ''
-        );
-
-
-    $customerEmail =
-        trim(
-            $_POST['customer_email'] ?? ''
-        );
-
-
-    $customerPhone =
-        trim(
-            $_POST['customer_phone'] ?? ''
-        );
-
-
-    $customerAddress =
-        trim(
-            $_POST['customer_address'] ?? ''
-        );
-
-
-    $issueDate =
-        trim(
-            $_POST['issue_date'] ?? ''
-        );
-
-
-    $itemsJson =
-        $_POST['items'] ?? '';
-
-
-    /* -------------------------
-       BASIC VALIDATION
-    ------------------------- */
+    $invoiceId = (int) ($_POST['invoice_id'] ?? 0);
+    $customerName = trim($_POST['customer_name'] ?? '');
+    $customerEmail = trim($_POST['customer_email'] ?? '');
+    $customerPhone = trim($_POST['customer_phone'] ?? '');
+    $customerAddress = trim($_POST['customer_address'] ?? '');
+    $issueDate = trim($_POST['issue_date'] ?? '');
+    $itemsJson = $_POST['items'] ?? '';
 
     if ($invoiceId <= 0) {
-
-        echo json_encode([
-            "success" => false,
-            "message" => "Invalid invoice."
-        ]);
-
+        echo json_encode(["success" => false, "message" => "Invalid invoice."]);
         exit;
     }
-
 
     if ($customerName === '') {
-
-        echo json_encode([
-            "success" => false,
-            "message" => "Customer name is required."
-        ]);
-
+        echo json_encode(["success" => false, "message" => "Customer name is required."]);
         exit;
     }
 
-
-    if (
-        $customerEmail === '' ||
-        !filter_var(
-            $customerEmail,
-            FILTER_VALIDATE_EMAIL
-        )
-    ) {
-
-        echo json_encode([
-            "success" => false,
-            "message" => "Please enter a valid customer email."
-        ]);
-
+    if ($customerEmail === '' || !filter_var($customerEmail, FILTER_VALIDATE_EMAIL)) {
+        echo json_encode(["success" => false, "message" => "Please enter a valid customer email."]);
         exit;
     }
-
 
     if ($customerPhone === '') {
-
-        echo json_encode([
-            "success" => false,
-            "message" => "Customer phone number is required."
-        ]);
-
+        echo json_encode(["success" => false, "message" => "Customer phone number is required."]);
         exit;
     }
-
 
     if ($customerAddress === '') {
-
-        echo json_encode([
-            "success" => false,
-            "message" => "Customer address is required."
-        ]);
-
+        echo json_encode(["success" => false, "message" => "Customer address is required."]);
         exit;
     }
-
 
     if ($issueDate === '') {
-
-        $issueDate =
-            date("Y-m-d");
+        $issueDate = date("Y-m-d");
     }
 
+    $dateObject = DateTime::createFromFormat('!Y-m-d', $issueDate);
 
-    $items =
-        json_decode(
-            $itemsJson,
-            true
-        );
-
-
-    if (
-        !is_array($items) ||
-        count($items) === 0
-    ) {
-
-        echo json_encode([
-            "success" => false,
-            "message" => "Please add at least one product."
-        ]);
-
+    if (!$dateObject || $dateObject->format('Y-m-d') !== $issueDate) {
+        echo json_encode(["success" => false, "message" => "Please enter a valid invoice date."]);
         exit;
     }
 
+    $items = json_decode($itemsJson, true);
 
-    /* =====================================================
-       CHECK INVOICE OWNERSHIP
-    ===================================================== */
-
-    $invoiceCheckStmt = $conn->prepare("
-        SELECT id
-        FROM invoices
-        WHERE id = ?
-        AND user_id = ?
-        LIMIT 1
-    ");
-
-    $invoiceCheckStmt->bind_param(
-        "ii",
-        $invoiceId,
-        $userId
-    );
-
-    $invoiceCheckStmt->execute();
-
-    $invoiceCheckResult =
-        $invoiceCheckStmt->get_result();
-
-    $invoiceBelongsToUser =
-        $invoiceCheckResult->num_rows === 1;
-
-    $invoiceCheckStmt->close();
-
-
-    if (!$invoiceBelongsToUser) {
-
-        echo json_encode([
-            "success" => false,
-            "message" => "Invoice not found."
-        ]);
-
+    if (!is_array($items) || count($items) === 0) {
+        echo json_encode(["success" => false, "message" => "Please add at least one product."]);
         exit;
     }
-
-
-    /* =====================================================
-       VALIDATE PRODUCTS
-    ===================================================== */
-
-    $validItems = [];
-
-    $subtotal = 0;
-
-
-    $productStmt = $conn->prepare("
-        SELECT
-            id,
-            product_name,
-            price
-        FROM products
-        WHERE id = ?
-        AND user_id = ?
-        LIMIT 1
-    ");
-
-
-    foreach ($items as $item) {
-
-        $productId =
-            isset($item['product_id'])
-                ? (int)$item['product_id']
-                : 0;
-
-
-        $quantity =
-            isset($item['quantity'])
-                ? (int)$item['quantity']
-                : 0;
-
-
-        $rate =
-            isset($item['rate'])
-                ? (float)$item['rate']
-                : 0;
-
-
-        if (
-            $productId <= 0 ||
-            $quantity <= 0 ||
-            $rate <= 0
-        ) {
-
-            continue;
-        }
-
-
-        $productStmt->bind_param(
-            "ii",
-            $productId,
-            $userId
-        );
-
-        $productStmt->execute();
-
-
-        $productResult =
-            $productStmt->get_result();
-
-
-        if (
-            $productResult->num_rows !== 1
-        ) {
-
-            continue;
-        }
-
-
-        $product =
-            $productResult->fetch_assoc();
-
-
-        $productName =
-            $product['product_name'];
-
-
-        $amount =
-            $quantity * $rate;
-
-
-        $subtotal +=
-            $amount;
-
-
-        $validItems[] = [
-
-            "product_id" =>
-                $productId,
-
-            "product_name" =>
-                $productName,
-
-            "quantity" =>
-                $quantity,
-
-            "rate" =>
-                $rate,
-
-            "amount" =>
-                $amount
-
-        ];
-    }
-
-
-    $productStmt->close();
-
-
-    if (
-        count($validItems) === 0
-    ) {
-
-        echo json_encode([
-            "success" => false,
-            "message" =>
-                "Please select a valid product and enter quantity and rate."
-        ]);
-
-        exit;
-    }
-
-
-    /* =====================================================
-       TAX
-    ===================================================== */
-
-    $tax = 0;
-
-
-    $total =
-        $subtotal + $tax;
-
-
-    /* =====================================================
-       UPDATE DATABASE
-    ===================================================== */
-
-    $conn->begin_transaction();
-
 
     try {
+        /* Verify invoice ownership */
+        $invoiceCheckStmt = $db->prepare("
+            SELECT id
+            FROM invoices
+            WHERE id = ? AND user_id = ?
+            LIMIT 1
+        ");
+        $invoiceCheckStmt->execute([$invoiceId, $userId]);
 
-        /*
-           Update invoice main details.
-        */
+        if (!$invoiceCheckStmt->fetch(PDO::FETCH_ASSOC)) {
+            echo json_encode(["success" => false, "message" => "Invoice not found."]);
+            exit;
+        }
 
-        $invoiceUpdateStmt = $conn->prepare("
+        /* Validate products belong to this user */
+        $validItems = [];
+        $subtotal = 0.00;
+
+        $productStmt = $db->prepare("
+            SELECT id, product_name
+            FROM products
+            WHERE id = ? AND user_id = ?
+            LIMIT 1
+        ");
+
+        foreach ($items as $item) {
+            if (!is_array($item)) {
+                continue;
+            }
+
+            $productId = (int) ($item['product_id'] ?? 0);
+            $quantity = (int) ($item['quantity'] ?? 0);
+            $rate = filter_var($item['rate'] ?? null, FILTER_VALIDATE_FLOAT);
+
+            if (
+                $productId <= 0 ||
+                $quantity <= 0 ||
+                $rate === false ||
+                !is_finite((float) $rate) ||
+                $rate <= 0
+            ) {
+                continue;
+            }
+
+            $productStmt->execute([$productId, $userId]);
+            $product = $productStmt->fetch(PDO::FETCH_ASSOC);
+
+            if (!$product) {
+                continue;
+            }
+
+            $rate = round((float) $rate, 2);
+            $amount = round($quantity * $rate, 2);
+
+            $subtotal += $amount;
+
+            $validItems[] = [
+                "product_id" => $productId,
+                "product_name" => $product['product_name'],
+                "quantity" => $quantity,
+                "rate" => $rate,
+                "amount" => $amount
+            ];
+        }
+
+        if (count($validItems) === 0) {
+            echo json_encode([
+                "success" => false,
+                "message" => "Please select a valid product and enter quantity and rate."
+            ]);
+            exit;
+        }
+
+        $subtotal = round($subtotal, 2);
+        $tax = 0.00;
+        $total = round($subtotal + $tax, 2);
+
+        /* Update invoice and its items atomically */
+        $db->beginTransaction();
+
+        $invoiceUpdateStmt = $db->prepare("
             UPDATE invoices
             SET
                 customer_name = ?,
@@ -599,13 +278,10 @@ if (
                 subtotal = ?,
                 tax = ?,
                 total = ?
-            WHERE id = ?
-            AND user_id = ?
+            WHERE id = ? AND user_id = ?
         ");
 
-
-        $invoiceUpdateStmt->bind_param(
-            "sssssdddii",
+        $invoiceUpdateStmt->execute([
             $customerName,
             $customerEmail,
             $customerPhone,
@@ -616,59 +292,16 @@ if (
             $total,
             $invoiceId,
             $userId
-        );
+        ]);
 
+        $deleteItemsStmt = $db->prepare("
+            DELETE FROM invoice_items
+            WHERE invoice_id = ?
+        ");
+        $deleteItemsStmt->execute([$invoiceId]);
 
-        if (
-            !$invoiceUpdateStmt->execute()
-        ) {
-
-            throw new Exception(
-                "Unable to update invoice."
-            );
-        }
-
-
-        $invoiceUpdateStmt->close();
-
-
-        /*
-           Remove old invoice items.
-        */
-
-        $deleteItemsStmt =
-            $conn->prepare("
-                DELETE FROM invoice_items
-                WHERE invoice_id = ?
-            ");
-
-
-        $deleteItemsStmt->bind_param(
-            "i",
-            $invoiceId
-        );
-
-
-        if (
-            !$deleteItemsStmt->execute()
-        ) {
-
-            throw new Exception(
-                "Unable to update invoice items."
-            );
-        }
-
-
-        $deleteItemsStmt->close();
-
-
-        /*
-           Insert updated items.
-        */
-
-        $insertItemStmt = $conn->prepare("
-            INSERT INTO invoice_items
-            (
+        $insertItemStmt = $db->prepare("
+            INSERT INTO invoice_items (
                 invoice_id,
                 product_id,
                 product_name,
@@ -679,199 +312,79 @@ if (
             VALUES (?, ?, ?, ?, ?, ?)
         ");
 
-
         foreach ($validItems as $item) {
-
-            $itemProductId =
-                $item['product_id'];
-
-            $itemProductName =
-                $item['product_name'];
-
-            $itemQuantity =
-                $item['quantity'];
-
-            $itemRate =
-                $item['rate'];
-
-            $itemAmount =
-                $item['amount'];
-
-
-            $insertItemStmt->bind_param(
-                "iisidd",
+            $insertItemStmt->execute([
                 $invoiceId,
-                $itemProductId,
-                $itemProductName,
-                $itemQuantity,
-                $itemRate,
-                $itemAmount
-            );
-
-
-            if (
-                !$insertItemStmt->execute()
-            ) {
-
-                throw new Exception(
-                    "Unable to save updated invoice items."
-                );
-            }
+                $item['product_id'],
+                $item['product_name'],
+                $item['quantity'],
+                $item['rate'],
+                $item['amount']
+            ]);
         }
 
-
-        $insertItemStmt->close();
-
-
-        $conn->commit();
-
+        $db->commit();
 
         echo json_encode([
             "success" => true,
-            "message" =>
-                "Invoice updated successfully."
+            "message" => "Invoice updated successfully."
         ]);
-
         exit;
 
+    } catch (Throwable $e) {
+        if ($db->inTransaction()) {
+            $db->rollBack();
+        }
 
-    } catch (Exception $e) {
+        error_log("Invoice update failed: " . $e->getMessage());
 
-        $conn->rollback();
-
+        http_response_code(500);
 
         echo json_encode([
             "success" => false,
-            "message" =>
-                $e->getMessage()
+            "message" => "Unable to update invoice. Please try again."
         ]);
-
         exit;
     }
 }
-
 
 /* =========================================================
    DASHBOARD STATISTICS
 ========================================================= */
 
 $totalInvoices = 0;
-
 $paidInvoices = 0;
-
 $pendingInvoices = 0;
+$totalSales = 0.00;
 
-$totalSales = 0;
-
-
-$stmtInvoiceStats =
-    $conn->prepare("
+try {
+    $stmtInvoiceStats = $db->prepare("
         SELECT
-
             COUNT(*) AS total_invoices,
-
-            COALESCE(
-                SUM(
-                    CASE
-                        WHEN total > 0
-                        THEN 1
-                        ELSE 0
-                    END
-                ),
-                0
-            ) AS paid_invoices,
-
-            COALESCE(
-                SUM(
-                    CASE
-                        WHEN total = 0
-                        THEN 1
-                        ELSE 0
-                    END
-                ),
-                0
-            ) AS pending_invoices,
-
-            COALESCE(
-                SUM(total),
-                0
-            ) AS total_sales
-
+            COALESCE(SUM(CASE WHEN total > 0 THEN 1 ELSE 0 END), 0) AS paid_invoices,
+            COALESCE(SUM(CASE WHEN total = 0 THEN 1 ELSE 0 END), 0) AS pending_invoices,
+            COALESCE(SUM(total), 0) AS total_sales
         FROM invoices
-
         WHERE user_id = ?
     ");
 
+    $stmtInvoiceStats->execute([$userId]);
+    $invoiceStats = $stmtInvoiceStats->fetch(PDO::FETCH_ASSOC);
 
-if ($stmtInvoiceStats) {
-
-    $stmtInvoiceStats->bind_param(
-        "i",
-        $userId
-    );
-
-    $stmtInvoiceStats->execute();
-
-
-    $invoiceStatsResult =
-        $stmtInvoiceStats->get_result();
-
-
-    if (
-        $invoiceStatsResult->num_rows > 0
-    ) {
-
-        $invoiceStats =
-            $invoiceStatsResult->fetch_assoc();
-
-
-        $totalInvoices =
-            (int)(
-                $invoiceStats[
-                    'total_invoices'
-                ] ?? 0
-            );
-
-
-        $paidInvoices =
-            (int)(
-                $invoiceStats[
-                    'paid_invoices'
-                ] ?? 0
-            );
-
-
-        $pendingInvoices =
-            (int)(
-                $invoiceStats[
-                    'pending_invoices'
-                ] ?? 0
-            );
-
-
-        $totalSales =
-            (float)(
-                $invoiceStats[
-                    'total_sales'
-                ] ?? 0
-            );
+    if ($invoiceStats) {
+        $totalInvoices = (int) ($invoiceStats['total_invoices'] ?? 0);
+        $paidInvoices = (int) ($invoiceStats['paid_invoices'] ?? 0);
+        $pendingInvoices = (int) ($invoiceStats['pending_invoices'] ?? 0);
+        $totalSales = (float) ($invoiceStats['total_sales'] ?? 0);
     }
 
-
-    $stmtInvoiceStats->close();
+} catch (PDOException $e) {
+    error_log("Dashboard statistics query failed: " . $e->getMessage());
+    http_response_code(500);
+    exit("Unable to load dashboard statistics.");
 }
 
-
-/* =========================================================
-   FORMATTED SALES
-========================================================= */
-
-$formattedTotalSales =
-    number_format(
-        $totalSales,
-        2
-    );
-
+$formattedTotalSales = number_format($totalSales, 2);
 
 /* =========================================================
    LOAD RECENT INVOICES
@@ -879,9 +392,8 @@ $formattedTotalSales =
 
 $recentInvoices = [];
 
-
-$stmtRecentInvoices =
-    $conn->prepare("
+try {
+    $stmtRecentInvoices = $db->prepare("
         SELECT
             id,
             invoice_number,
@@ -899,94 +411,42 @@ $stmtRecentInvoices =
         LIMIT 3
     ");
 
+    $stmtRecentInvoices->execute([$userId]);
+    $recentInvoices = $stmtRecentInvoices->fetchAll(PDO::FETCH_ASSOC);
 
-$stmtRecentInvoices->bind_param(
-    "i",
-    $userId
-);
+    $itemStmt = $db->prepare("
+        SELECT
+            id,
+            product_id,
+            product_name,
+            quantity,
+            rate,
+            amount
+        FROM invoice_items
+        WHERE invoice_id = ?
+        ORDER BY id ASC
+    ");
 
-
-$stmtRecentInvoices->execute();
-
-
-$recentInvoiceResult =
-    $stmtRecentInvoices->get_result();
-
-
-while (
-    $invoice =
-        $recentInvoiceResult->fetch_assoc()
-) {
-
-    $invoiceId =
-        (int)$invoice['id'];
-
-
-    $invoice['items'] = [];
-
-
-    /*
-       Load products for this invoice.
-    */
-
-    $itemStmt =
-        $conn->prepare("
-            SELECT
-                id,
-                product_id,
-                product_name,
-                quantity,
-                rate,
-                amount
-            FROM invoice_items
-            WHERE invoice_id = ?
-            ORDER BY id ASC
-        ");
-
-
-    $itemStmt->bind_param(
-        "i",
-        $invoiceId
-    );
-
-
-    $itemStmt->execute();
-
-
-    $itemResult =
-        $itemStmt->get_result();
-
-
-    while (
-        $item =
-            $itemResult->fetch_assoc()
-    ) {
-
-        $invoice['items'][] =
-            $item;
+    foreach ($recentInvoices as &$invoice) {
+        $itemStmt->execute([(int) $invoice['id']]);
+        $invoice['items'] = $itemStmt->fetchAll(PDO::FETCH_ASSOC);
     }
+    unset($invoice);
 
-
-    $itemStmt->close();
-
-
-    $recentInvoices[] =
-        $invoice;
+} catch (PDOException $e) {
+    error_log("Recent invoices query failed: " . $e->getMessage());
+    http_response_code(500);
+    exit("Unable to load recent invoices.");
 }
 
-
-$stmtRecentInvoices->close();
-
-
 /* =========================================================
-   LOAD PRODUCTS FOR UPDATE
+   LOAD PRODUCTS FOR INVOICE UPDATE
 ========================================================= */
 
 $products = [];
 
-
-$productListStmt =
-    $conn->prepare("
+try {
+    $productListStmt = $db->prepare("
         SELECT
             id,
             product_name,
@@ -998,51 +458,24 @@ $productListStmt =
         ORDER BY product_name ASC
     ");
 
+    $productListStmt->execute([$userId]);
+    $products = $productListStmt->fetchAll(PDO::FETCH_ASSOC);
 
-$productListStmt->bind_param(
-    "i",
-    $userId
-);
-
-
-$productListStmt->execute();
-
-
-$productListResult =
-    $productListStmt->get_result();
-
-
-while (
-    $productRow =
-        $productListResult->fetch_assoc()
-) {
-
-    $products[] =
-        $productRow;
+} catch (PDOException $e) {
+    error_log("Product list query failed: " . $e->getMessage());
+    http_response_code(500);
+    exit("Unable to load products.");
 }
-
-
-$productListStmt->close();
-
 
 /* =========================================================
    FLASH MESSAGE
 ========================================================= */
 
-$dashboardMessage =
-    $_SESSION['dashboard_message']
-    ?? '';
-
-$dashboardMessageType =
-    $_SESSION['dashboard_message_type']
-    ?? '';
-
+$dashboardMessage = $_SESSION['dashboard_message'] ?? '';
+$dashboardMessageType = $_SESSION['dashboard_message_type'] ?? '';
 
 unset(
-    $_SESSION['dashboard_message']
-);
-
-unset(
+    $_SESSION['dashboard_message'],
     $_SESSION['dashboard_message_type']
 );
 
