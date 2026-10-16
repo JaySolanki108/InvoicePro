@@ -11,18 +11,20 @@ if (!isset($_SESSION['user_id'])) {
     exit;
 }
 
-$userId = (int)$_SESSION['user_id'];
-
+$userId = (int) $_SESSION['user_id'];
 
 /* =========================================================
-   HELPER
+   HELPER FUNCTION
 ========================================================= */
 
 function clean($value)
 {
-    return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8');
+    return htmlspecialchars(
+        (string) $value,
+        ENT_QUOTES,
+        'UTF-8'
+    );
 }
-
 
 /* =========================================================
    GET LOGGED-IN USER / COMPANY DETAILS
@@ -35,47 +37,60 @@ $companyPhone = "";
 $companyAddress = "";
 $memberSince = "";
 
-$stmt = $conn->prepare("
-    SELECT id, company_name, company_email, phone, address, created_at
-    FROM users
-    WHERE id = ?
-    LIMIT 1
-");
+try {
+    $stmt = $db->prepare("
+        SELECT
+            id,
+            company_name,
+            company_email,
+            phone,
+            address,
+            created_at
+        FROM users
+        WHERE id = ?
+        LIMIT 1
+    ");
 
-$stmt->bind_param("i", $userId);
-$stmt->execute();
+    $stmt->execute([$userId]);
+    $user = $stmt->fetch(PDO::FETCH_ASSOC);
 
-$userResult = $stmt->get_result();
+    if (!$user) {
+        session_unset();
+        session_destroy();
 
-if ($userResult->num_rows !== 1) {
-    session_destroy();
-    header("Location: Login.php");
-    exit;
+        header("Location: Login.php");
+        exit;
+    }
+
+    $companyName = $user['company_name'] ?? "Company";
+    $companyEmail = $user['company_email'] ?? "";
+    $companyPhone = $user['phone'] ?? "";
+    $companyAddress = $user['address'] ?? "";
+
+    $userName = $companyName;
+
+    if (!empty($user['created_at'])) {
+        $memberSince = date(
+            "d M Y",
+            strtotime($user['created_at'])
+        );
+    }
+} catch (PDOException $e) {
+    error_log("Create Invoice user query failed: " . $e->getMessage());
+
+    http_response_code(500);
+    exit("Unable to load account details. Please try again later.");
 }
-
-$user = $userResult->fetch_assoc();
-
-$stmt->close();
-
-$companyName = $user['company_name'] ?? "Company";
-$companyEmail = $user['company_email'] ?? "";
-$companyPhone = $user['phone'] ?? "";
-$companyAddress = $user['address'] ?? "";
-
-$userName = $companyName;
-
-if (!empty($user['created_at'])) {
-    $memberSince = date("d M Y", strtotime($user['created_at']));
-}
-
 
 /* =========================================================
    AJAX - CREATE INVOICE
 ========================================================= */
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'create_invoice') {
-
-    header('Content-Type: application/json');
+if (
+    $_SERVER['REQUEST_METHOD'] === 'POST' &&
+    ($_POST['action'] ?? '') === 'create_invoice'
+) {
+    header('Content-Type: application/json; charset=utf-8');
 
     $customerName = trim($_POST['customer_name'] ?? '');
     $customerEmail = trim($_POST['customer_email'] ?? '');
@@ -85,7 +100,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     $itemsJson = $_POST['items'] ?? '';
 
     /* -------------------------
-       Validation
+       VALIDATION
     ------------------------- */
 
     if ($customerName === '') {
@@ -96,7 +111,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         exit;
     }
 
-    if ($customerEmail === '' || !filter_var($customerEmail, FILTER_VALIDATE_EMAIL)) {
+    if (
+        $customerEmail === '' ||
+        !filter_var($customerEmail, FILTER_VALIDATE_EMAIL)
+    ) {
         echo json_encode([
             "success" => false,
             "message" => "Please enter a valid customer email."
@@ -124,6 +142,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         $issueDate = date("Y-m-d");
     }
 
+    $dateObject = DateTime::createFromFormat('!Y-m-d', $issueDate);
+
+    if (
+        !$dateObject ||
+        $dateObject->format('Y-m-d') !== $issueDate
+    ) {
+        echo json_encode([
+            "success" => false,
+            "message" => "Please enter a valid invoice date."
+        ]);
+        exit;
+    }
+
     $items = json_decode($itemsJson, true);
 
     if (!is_array($items) || count($items) === 0) {
@@ -134,103 +165,110 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         exit;
     }
 
-
     /* =====================================================
        VALIDATE PRODUCTS FROM DATABASE
     ===================================================== */
 
     $validItems = [];
-    $subtotal = 0;
-
-    $productStmt = $conn->prepare("
-        SELECT id, product_name, price
-        FROM products
-        WHERE id = ? AND user_id = ?
-        LIMIT 1
-    ");
-
-    foreach ($items as $item) {
-
-        $productId = isset($item['product_id']) ? (int)$item['product_id'] : 0;
-        $quantity = isset($item['quantity']) ? (int)$item['quantity'] : 0;
-        $rate = isset($item['rate']) ? (float)$item['rate'] : 0;
-
-        if ($productId <= 0 || $quantity <= 0 || $rate <= 0) {
-            continue;
-        }
-
-        $productStmt->bind_param("ii", $productId, $userId);
-        $productStmt->execute();
-
-        $productResult = $productStmt->get_result();
-
-        if ($productResult->num_rows !== 1) {
-            continue;
-        }
-
-        $product = $productResult->fetch_assoc();
-
-        $productName = $product['product_name'];
-
-        /*
-         * Rate comes from the form so the user can adjust
-         * the selling rate if required.
-         */
-        $amount = $quantity * $rate;
-
-        $subtotal += $amount;
-
-        $validItems[] = [
-            "product_id" => $productId,
-            "product_name" => $productName,
-            "quantity" => $quantity,
-            "rate" => $rate,
-            "amount" => $amount
-        ];
-    }
-
-    $productStmt->close();
-
-
-    if (count($validItems) === 0) {
-        echo json_encode([
-            "success" => false,
-            "message" => "Please select a valid product and enter quantity and rate."
-        ]);
-        exit;
-    }
-
-
-    /* =====================================================
-       TAX
-    ===================================================== */
-
-    $tax = 0;
-    $total = $subtotal + $tax;
-
-
-    /* =====================================================
-       GENERATE INVOICE NUMBER
-    ===================================================== */
-
-    $invoiceNumber = "INV-" . date("Ymd") . "-" . strtoupper(substr(uniqid(), -5));
-
-
-    /* =====================================================
-       DATABASE TRANSACTION
-    ===================================================== */
-
-    $conn->begin_transaction();
+    $subtotal = 0.00;
 
     try {
+        $productStmt = $db->prepare("
+            SELECT
+                id,
+                product_name,
+                price
+            FROM products
+            WHERE id = ?
+              AND user_id = ?
+            LIMIT 1
+        ");
+
+        foreach ($items as $item) {
+            if (!is_array($item)) {
+                continue;
+            }
+
+            $productId = (int) ($item['product_id'] ?? 0);
+            $quantity = (int) ($item['quantity'] ?? 0);
+            $rate = (float) ($item['rate'] ?? 0);
+
+            if (
+                $productId <= 0 ||
+                $quantity <= 0 ||
+                $rate <= 0 ||
+                !is_finite($rate)
+            ) {
+                continue;
+            }
+
+            $productStmt->execute([
+                $productId,
+                $userId
+            ]);
+
+            $product = $productStmt->fetch(PDO::FETCH_ASSOC);
+
+            /*
+             * The product must belong to the logged-in user.
+             */
+            if (!$product) {
+                continue;
+            }
+
+            $productName = $product['product_name'];
+            $amount = round($quantity * $rate, 2);
+
+            $subtotal += $amount;
+
+            $validItems[] = [
+                "product_id" => $productId,
+                "product_name" => $productName,
+                "quantity" => $quantity,
+                "rate" => $rate,
+                "amount" => $amount
+            ];
+        }
+
+        if (count($validItems) === 0) {
+            echo json_encode([
+                "success" => false,
+                "message" => "Please select a valid product and enter quantity and rate."
+            ]);
+            exit;
+        }
+
+        $subtotal = round($subtotal, 2);
+
+        /* =====================================================
+           TAX AND TOTAL
+        ===================================================== */
+
+        $tax = 0.00;
+        $total = round($subtotal + $tax, 2);
+
+        /* =====================================================
+           GENERATE INVOICE NUMBER
+        ===================================================== */
+
+        $invoiceNumber = sprintf(
+            "INV-%s-%s",
+            date("Ymd"),
+            strtoupper(bin2hex(random_bytes(4)))
+        );
+
+        /* =====================================================
+           DATABASE TRANSACTION
+        ===================================================== */
+
+        $db->beginTransaction();
 
         /* -------------------------
            INSERT INVOICE
         ------------------------- */
 
-        $invoiceStmt = $conn->prepare("
-            INSERT INTO invoices
-            (
+        $invoiceStmt = $db->prepare("
+            INSERT INTO invoices (
                 user_id,
                 invoice_number,
                 customer_name,
@@ -245,8 +283,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ");
 
-        $invoiceStmt->bind_param(
-            "issssssddd",
+        $invoiceStmt->execute([
             $userId,
             $invoiceNumber,
             $customerName,
@@ -257,24 +294,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             $subtotal,
             $tax,
             $total
-        );
+        ]);
 
-        if (!$invoiceStmt->execute()) {
-            throw new Exception("Unable to create invoice.");
-        }
-
-        $invoiceId = $conn->insert_id;
-
-        $invoiceStmt->close();
-
+        $invoiceId = (int) $db->lastInsertId();
 
         /* -------------------------
            INSERT INVOICE ITEMS
         ------------------------- */
 
-        $itemStmt = $conn->prepare("
-            INSERT INTO invoice_items
-            (
+        $itemStmt = $db->prepare("
+            INSERT INTO invoice_items (
                 invoice_id,
                 product_id,
                 product_name,
@@ -286,44 +315,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         ");
 
         foreach ($validItems as $item) {
-
-            $itemProductId = $item['product_id'];
-            $itemProductName = $item['product_name'];
-            $itemQuantity = $item['quantity'];
-            $itemRate = $item['rate'];
-            $itemAmount = $item['amount'];
-
-            $itemStmt->bind_param(
-                "iisidd",
+            $itemStmt->execute([
                 $invoiceId,
-                $itemProductId,
-                $itemProductName,
-                $itemQuantity,
-                $itemRate,
-                $itemAmount
-            );
-
-            if (!$itemStmt->execute()) {
-                throw new Exception("Unable to save invoice items.");
-            }
+                $item['product_id'],
+                $item['product_name'],
+                $item['quantity'],
+                $item['rate'],
+                $item['amount']
+            ]);
         }
 
-        $itemStmt->close();
-
-
         /* -------------------------
-           COMMIT
+           COMMIT TRANSACTION
         ------------------------- */
 
-        $conn->commit();
-
+        $db->commit();
 
         echo json_encode([
             "success" => true,
             "message" => "Invoice created successfully.",
             "invoice_id" => $invoiceId,
             "invoice_number" => $invoiceNumber,
-            "issue_date" => date("d-m-Y", strtotime($issueDate)),
+            "issue_date" => date(
+                "d-m-Y",
+                strtotime($issueDate)
+            ),
             "subtotal" => number_format($subtotal, 2, '.', ''),
             "tax" => number_format($tax, 2, '.', ''),
             "total" => number_format($total, 2, '.', '')
@@ -331,19 +347,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
 
         exit;
 
-    } catch (Exception $e) {
+    } catch (Throwable $e) {
+        if ($db->inTransaction()) {
+            $db->rollBack();
+        }
 
-        $conn->rollback();
+        error_log("Invoice creation failed: " . $e->getMessage());
+
+        http_response_code(500);
 
         echo json_encode([
             "success" => false,
-            "message" => $e->getMessage()
+            "message" => "Unable to create the invoice right now. Please check the details and try again."
         ]);
 
         exit;
     }
 }
-
 
 /* =========================================================
    LOAD PRODUCTS FROM DATABASE
@@ -351,24 +371,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
 
 $products = [];
 
-$productListStmt = $conn->prepare("
-    SELECT id, product_name, description, price, stock
-    FROM products
-    WHERE user_id = ?
-    ORDER BY product_name ASC
-");
+try {
+    $productListStmt = $db->prepare("
+        SELECT
+            id,
+            product_name,
+            description,
+            price,
+            stock
+        FROM products
+        WHERE user_id = ?
+        ORDER BY product_name ASC
+    ");
 
-$productListStmt->bind_param("i", $userId);
-$productListStmt->execute();
+    $productListStmt->execute([$userId]);
 
-$productListResult = $productListStmt->get_result();
+    $products = $productListStmt->fetchAll(PDO::FETCH_ASSOC);
 
-while ($productRow = $productListResult->fetch_assoc()) {
-    $products[] = $productRow;
+} catch (PDOException $e) {
+    error_log("Product loading failed: " . $e->getMessage());
+
+    http_response_code(500);
+    exit("Unable to load products. Please try again later.");
 }
-
-$productListStmt->close();
-
 
 /* =========================================================
    CURRENT DATE
