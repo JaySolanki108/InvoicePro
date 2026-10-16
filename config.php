@@ -11,7 +11,7 @@ $caFile = __DIR__ . '/ca.pem';
 
 if (!$dbHost || !$dbUser || !$dbPass) {
     die('Database configuration is missing. Check Render environment variables.');
-}
+}   
 
 try {
     $options = [    
